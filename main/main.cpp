@@ -6,6 +6,8 @@
 
 #include "driver/gpio.h"
 #include "sk9822_leds.hpp"
+#include "led_patterns.h"
+
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
@@ -26,7 +28,7 @@
 #define LED_SPI_CLK_PIN GPIO_NUM_8
 #define LED_SPI_MOSI_PIN GPIO_NUM_10
 #define LED_RENDER_PERIOD_MS 33
-#define LED_MODE_COUNT 5
+#define LED_MODE_COUNT 6
 #define BUTTON_TASK_STACK_SIZE 3072
 #define RENDER_TASK_STACK_SIZE 3072
 
@@ -35,6 +37,7 @@ static TaskHandle_t button_task_handle;
 static TaskHandle_t render_task_handle;
 static TimerHandle_t render_timer_handle;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
+
 
 struct LightApplicationState
 {
@@ -70,7 +73,7 @@ static LightApplicationState LightApplicationState_AdvanceLedStyle()
     LightApplicationState state;
 
     portENTER_CRITICAL(&state_lock);
-    light_app_state.LedStyle = (light_app_state.LedStyle + 1U) % LED_MODE_COUNT;
+    light_app_state.LedStyle = (light_app_state.LedStyle % LED_MODE_COUNT) + 1U;
     state = light_app_state;
     portEXIT_CRITICAL(&state_lock);
 
@@ -90,14 +93,20 @@ static void LightApplicationState_RenderLeds(LightApplicationState& state)
     static OffPattern off_pattern;
     static SolidRedPattern solid_red_pattern;
     static ChasePattern chase_pattern;
-    static RainbowPattern rainbow_pattern;
     static PulsePattern pulse_pattern;
+    static StrobePattern strobe_pattern;
+    static TwinklePattern twinkle_pattern;
+    static const SK9822_Led kFireColors[] = {
+        {20, 150, 60, 255},
+        {20, 220, 170,  0},
+    };
+    static RandomPattern random_pattern(kFireColors, 2, 100);
 
-    const uint32_t timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    uint32_t const now = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
     if (!state.PowerOn)
     {
-        led_strip.Prepare(off_pattern, timestamp_ms);
+        led_strip.Apply(off_pattern, now);
         led_strip.Render();
         return;
     }
@@ -106,11 +115,13 @@ static void LightApplicationState_RenderLeds(LightApplicationState& state)
 
     switch (current_state.LedStyle)
     {
-        case 1: led_strip.Prepare(solid_red_pattern, timestamp_ms); break;
-        case 2: led_strip.Prepare(chase_pattern, timestamp_ms); break;
-        case 3: led_strip.Prepare(rainbow_pattern, timestamp_ms); break;
-        case 4: led_strip.Prepare(pulse_pattern, timestamp_ms); break;
-        default: led_strip.Prepare(solid_red_pattern, timestamp_ms); break;
+        case 1: led_strip.Apply(solid_red_pattern, now); break;
+        case 2: led_strip.Apply(chase_pattern, now); break;
+        case 3: led_strip.Apply(pulse_pattern, now); break;
+        case 4: led_strip.Apply(strobe_pattern, now); break;
+        case 5: led_strip.Apply(twinkle_pattern, now); break;
+        case 6: led_strip.Apply(random_pattern, now); break;
+        default: led_strip.Apply(solid_red_pattern, now); break;
     }
 
     led_strip.Render();
@@ -213,7 +224,7 @@ extern "C" void app_main(void)
         .intr_type = GPIO_INTR_ANYEDGE,
     };
 
-    ESP_ERROR_CHECK(SK9822_Leds_Init(LED_SPI_CLK_PIN, LED_SPI_MOSI_PIN));
+    ESP_ERROR_CHECK(led_strip.InitSPI(LED_SPI_CLK_PIN, LED_SPI_MOSI_PIN));
 
     ESP_ERROR_CHECK(gpio_config(&button_config));
     ESP_ERROR_CHECK(gpio_install_isr_service(0));

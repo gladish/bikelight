@@ -1,8 +1,12 @@
 #pragma once
 
 #include <stdint.h>
+
 #include "esp_err.h"
+#include "esp_log.h"
+
 #include "driver/gpio.h"
+#include "driver/spi_master.h"
 
 // ---------------------------------------------------------------------------
 // SK9822 single LED pixel
@@ -32,10 +36,7 @@ esp_err_t SK9822_Leds_Init(gpio_num_t clk_pin, gpio_num_t mosi_pin);
 // These operate on raw arrays and are the building blocks for SK9822_LedStrip.
 // ---------------------------------------------------------------------------
 
-void SK9822_Led_PrepareAnimation_Off(SK9822_Led *leds, int count);
-void SK9822_Led_PrepareAnimation_Chase(SK9822_Led *leds, int count, uint32_t frame);
-void SK9822_Led_PrepareAnimation_Rainbow(SK9822_Led *leds, int count, uint32_t frame);
-void SK9822_Led_PrepareAnimation_Pulse(SK9822_Led *leds, int count, uint32_t frame);
+void SK9822_Led_Zero(SK9822_Led *strip, int led_count);
 void SK9822_Led_Render(const SK9822_Led *leds, uint8_t *tx_buffer, int count);
 
 // ---------------------------------------------------------------------------
@@ -49,59 +50,18 @@ class LedPattern
 {
 public:
     virtual ~LedPattern() = default;
-    virtual void Prepare(SK9822_Led *leds, int count, uint32_t now) = 0;
 
+    virtual void Apply(SK9822_Led *leds, int count, uint32_t now) = 0;
+
+    // brightness is 0-31 (percent).
     void SetBrightness(uint8_t brightness)
-        { brightness_ = brightness; }
+            { brightness_ = brightness > 31 ? 31 : brightness; }
 
     uint8_t Brightness() const
         { return brightness_; }
 
 protected:
-    uint8_t brightness_ = 20;
-};
-
-class OffPattern final : public LedPattern
-{
-public:
-    void Prepare(SK9822_Led *leds, int count, uint32_t now) override;
-};
-
-class SolidRedPattern final : public LedPattern
-{
-public:
-    void Prepare(SK9822_Led *leds, int count, uint32_t now) override;
-private:
-};
-
-class ChasePattern final : public LedPattern
-{
-public:
-    void Prepare(SK9822_Led *leds, int count, uint32_t now) override;
-
-private:
-    bool forward_ = true;
-    uint32_t last_update_ = 0;
-    uint32_t interval_ = 100;
-    int index_ = 0;
-};
-
-class RainbowPattern final : public LedPattern
-{
-public:
-    void Prepare(SK9822_Led *leds, int count, uint32_t now) override;
-
-private:
-    uint32_t frame_ = 0;
-};
-
-class PulsePattern final : public LedPattern
-{
-public:
-    void Prepare(SK9822_Led *leds, int count, uint32_t now) override;
-
-private:
-    uint32_t frame_ = 0;
+    uint8_t brightness_ = 18;
 };
 
 template<int N>
@@ -112,16 +72,78 @@ public:
 
     static constexpr int kLedCount = N;
 
-    void Clear()
-        { SK9822_Led_PrepareAnimation_Off(leds_, kLedCount); }
+    esp_err_t InitSPI(gpio_num_t clk_pin, gpio_num_t mosi_pin)
+    {
+        spi_transaction_ = {};
+        spi_transaction_.length = 8 * (size_t)SK9822_TX_BUFFER_SIZE(kLedCount);
+        spi_transaction_.tx_buffer = tx_buffer_;
 
-    void Prepare(LedPattern &pattern, uint32_t now)
-        { pattern.Prepare(leds_, kLedCount, now); }
+        spi_bus_config_t buscfg = {};
+        buscfg.mosi_io_num = mosi_pin;
+        buscfg.sclk_io_num = clk_pin;
+        buscfg.max_transfer_sz = 4096;
+
+        spi_device_interface_config_t devcfg = {};
+        devcfg.clock_speed_hz = 1 * 1000 * 1000; // 1 MHz
+        devcfg.mode = 0;
+        devcfg.spics_io_num = -1; // SK9822 uses start/end frames instead of CS
+        devcfg.queue_size = 1;
+
+        esp_err_t err = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE("SK9822_LedStrip", "spi_bus_initialize failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        err = spi_bus_add_device(SPI2_HOST, &devcfg, &spi_handle_);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE("SK9822_LedStrip", "spi_bus_add_device failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        return ESP_OK;
+    }
+
+    void Clear() { SK9822_Led_PrepareAnimation_Off(leds_, kLedCount); }
+
+    void Apply(LedPattern &pattern, uint32_t now) { pattern.Apply(leds_, kLedCount, now); }
 
     void Render()
-        { SK9822_Led_Render(leds_, tx_buffer_, kLedCount); }
+    {
+        // SK9822 protocol: 4-byte start frame, one 4-byte frame per LED, 4-byte end frame
+        int idx = 0;
+
+        tx_buffer_[idx++] = 0x00;
+        tx_buffer_[idx++] = 0x00;
+        tx_buffer_[idx++] = 0x00;
+        tx_buffer_[idx++] = 0x00;
+
+        for (int i = 0; i < kLedCount; i++)
+        {
+            tx_buffer_[idx++] = 0xE0U | (leds_[i].Brightness & 0x1FU);
+            tx_buffer_[idx++] = leds_[i].Blue;
+            tx_buffer_[idx++] = leds_[i].Green;
+            tx_buffer_[idx++] = leds_[i].Red;
+        }
+
+        tx_buffer_[idx++] = 0xFF;
+        tx_buffer_[idx++] = 0xFF;
+        tx_buffer_[idx++] = 0xFF;
+        tx_buffer_[idx++] = 0xFF;
+
+        spi_transaction_ = {};
+        spi_transaction_.length = 8 * (size_t)SK9822_TX_BUFFER_SIZE(kLedCount);
+        spi_transaction_.tx_buffer = tx_buffer_;
+
+        spi_device_transmit(spi_handle_, &spi_transaction_);
+    }
 
 private:
     SK9822_Led leds_[kLedCount];
     uint8_t tx_buffer_[SK9822_TX_BUFFER_SIZE(kLedCount)];
+
+    spi_device_handle_t spi_handle_;
+    spi_transaction_t spi_transaction_;
 };
