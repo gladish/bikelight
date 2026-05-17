@@ -41,6 +41,10 @@ static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t current_led_design = 1;
 static SK9822_LedStrip<kLedStripLength> led_strip;
 
+// deep sleep saved
+RTC_DATA_ATTR int saved_led_design = 0;
+
+
 static void LightApplicationState_RenderLeds()
 {
   static OffPattern off_pattern;
@@ -107,6 +111,7 @@ static void enter_deep_sleep(void)
   }
 
   vTaskDelay(pdMS_TO_TICKS(kButtonDebounceMs));
+  saved_led_design = current_led_design;
 
   esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(BIT(kGpioButton), ESP_GPIO_WAKEUP_GPIO_LOW);
   esp_deep_sleep_start();
@@ -201,8 +206,11 @@ extern "C" void app_main(void)
       .intr_type = GPIO_INTR_ANYEDGE,
   };
 
-  ESP_ERROR_CHECK(led_strip.InitSPI(kGpioLedStringClock, kGpioLedStripData));
+  if (saved_led_design != 0) {
+    current_led_design = saved_led_design;
+  }
 
+  ESP_ERROR_CHECK(led_strip.InitSPI(kGpioLedStringClock, kGpioLedStripData));
   ESP_ERROR_CHECK(gpio_config(&button_config));
   ESP_ERROR_CHECK(gpio_install_isr_service(0));
 
