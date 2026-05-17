@@ -106,7 +106,7 @@ public:
         return ESP_OK;
     }
 
-    void Clear() { SK9822_Led_PrepareAnimation_Off(leds_, kLedCount); }
+    void Clear() { SK9822_Led_Zero(leds_, kLedCount); }
 
     void Apply(LedPattern &pattern, uint32_t now) { pattern.Apply(leds_, kLedCount, now); }
 

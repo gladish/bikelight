@@ -3,11 +3,10 @@
  *
  * SPDX-License-Identifier: CC0-1.0
  */
-
-#include "driver/gpio.h"
 #include "sk9822_leds.hpp"
 #include "led_patterns.h"
 
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
@@ -16,6 +15,7 @@
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "sdkconfig.h"
+
 #include <assert.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -37,58 +37,35 @@ static TaskHandle_t button_task_handle;
 static TaskHandle_t render_task_handle;
 static TimerHandle_t render_timer_handle;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
-
-
-struct LightApplicationState
-{
-    bool PowerOn;
-    uint8_t LedStyle;
-};
-
+static uint8_t led_render_pattern = 1;
 static SK9822_LedStrip<8> led_strip;
 
-static LightApplicationState CreateLightApplicationState(void)
-{
-    LightApplicationState state = {};
-    state.PowerOn = true;
-    state.LedStyle = 1;
-    return state;
-}
 
-static LightApplicationState light_app_state = CreateLightApplicationState();
-
-static LightApplicationState LightApplicationState_GetCurrentStyle()
+static uint8_t GetCurrentLEDRenderPattern()
 {
-    LightApplicationState state;
+    uint8_t state;
 
     portENTER_CRITICAL(&state_lock);
-    state = light_app_state;
+    state = led_render_pattern;
     portEXIT_CRITICAL(&state_lock);
 
     return state;
 }
 
-static LightApplicationState LightApplicationState_AdvanceLedStyle()
+static uint8_t AdvanceLedRenderPattern()
 {
-    LightApplicationState state;
+    uint8_t state;
 
     portENTER_CRITICAL(&state_lock);
-    light_app_state.LedStyle = (light_app_state.LedStyle % LED_MODE_COUNT) + 1U;
-    state = light_app_state;
+    led_render_pattern = (led_render_pattern % LED_MODE_COUNT) + 1U;
+    state = led_render_pattern;
     portEXIT_CRITICAL(&state_lock);
 
     return state;
 }
 
-static void LightApplicationState_SetPower(bool power_on)
-{
-    portENTER_CRITICAL(&state_lock);
-    light_app_state.PowerOn = power_on;
-    portEXIT_CRITICAL(&state_lock);
-}
 
-
-static void LightApplicationState_RenderLeds(LightApplicationState& state)
+static void LightApplicationState_RenderLeds()
 {
     static OffPattern off_pattern;
     static SolidRedPattern solid_red_pattern;
@@ -104,16 +81,8 @@ static void LightApplicationState_RenderLeds(LightApplicationState& state)
 
     uint32_t const now = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
-    if (!state.PowerOn)
-    {
-        led_strip.Apply(off_pattern, now);
-        led_strip.Render();
-        return;
-    }
-
-    LightApplicationState current_state = LightApplicationState_GetCurrentStyle();
-
-    switch (current_state.LedStyle)
+    uint8_t current_pattern = GetCurrentLEDRenderPattern();
+    switch (current_pattern)
     {
         case 1: led_strip.Apply(solid_red_pattern, now); break;
         case 2: led_strip.Apply(chase_pattern, now); break;
@@ -130,16 +99,23 @@ static void LightApplicationState_RenderLeds(LightApplicationState& state)
 static void enter_deep_sleep(void)
 {
     ESP_LOGI(TAG, "Entering deep sleep; press button to wake");
-    LightApplicationState_SetPower(false);
 
     if (render_timer_handle != NULL)
     {
         xTimerStop(render_timer_handle, portMAX_DELAY);
     }
 
-    ESP_ERROR_CHECK(gpio_wakeup_enable(BUTTON_GPIO, GPIO_INTR_LOW_LEVEL));
-    ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
+    led_strip.Clear();
+    led_strip.Render();
 
+    while (gpio_get_level(BUTTON_GPIO) == 0)
+    {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+
+    esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(BIT(BUTTON_GPIO), ESP_GPIO_WAKEUP_GPIO_LOW);
     esp_deep_sleep_start();
 }
 
@@ -157,7 +133,7 @@ static void render_task(void *__unused(argp))
     while (1)
     {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        LightApplicationState_RenderLeds( light_app_state );
+        LightApplicationState_RenderLeds();
     }
 }
 
@@ -165,6 +141,8 @@ static void button_task(void *__unused(arg))
 {
     int last_level = gpio_get_level(BUTTON_GPIO);
     TickType_t pressed_at = 0;
+
+    bool long_press_handled = false;
 
     // ESP_LOGI(TAG, "Monitoring button on GPIO %d", BUTTON_GPIO);
     // ESP_LOGI(TAG, "Button %s", last_level == 0 ? "pressed" : "released");
@@ -186,20 +164,32 @@ static void button_task(void *__unused(arg))
         if (level == 0)
         {
             pressed_at = xTaskGetTickCount();
+            long_press_handled = false;
+
+            while (gpio_get_level(BUTTON_GPIO) == 0)
+            {
+                uint32_t const held_ms = (xTaskGetTickCount() - pressed_at) * portTICK_PERIOD_MS;
+
+                if (!long_press_handled && held_ms >= BUTTON_LONG_PRESS_MS)
+                {
+                    long_press_handled = true;
+                    ESP_LOGI(TAG, "Long press detected (%" PRIu32 " ms)", held_ms);
+                    enter_deep_sleep();
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+
             continue;
         }
 
-        const TickType_t held_ticks = xTaskGetTickCount() - pressed_at;
-        const uint32_t held_ms = held_ticks * portTICK_PERIOD_MS;
-
-        if (held_ms >= BUTTON_LONG_PRESS_MS)
+        if (long_press_handled)
         {
-            enter_deep_sleep();
             continue;
         }
 
-        const LightApplicationState new_state = LightApplicationState_AdvanceLedStyle();
-        ESP_LOGI(TAG, "Active LED mode: %u", new_state.LedStyle);
+        uint8_t const new_pattern = AdvanceLedRenderPattern();
+        ESP_LOGI(TAG, "Active LED mode: %u", new_pattern);
     }
 }
 
