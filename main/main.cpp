@@ -8,6 +8,9 @@
 #include <esp_log.h>
 #include <esp_sleep.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
 #include <button_gpio.h>
 #include <iot_button.h>
 #include <led_strip_spi.h>
@@ -29,17 +32,19 @@ static constexpr uint32_t kRenderTaskStackSize = 3072;
 // globals
 static const char* TAG = "main";
 static TaskHandle_t render_task_handle;
+static TaskHandle_t render_stop_waiter_handle;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t current_led_pattern = 1;
 static bool in_setup_mode = false;
+static bool stop_render_requested = false;
 
 // deep sleep saved
 RTC_DATA_ATTR int saved_led_pattern = 0;
 
-static void render_solid_color_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color)
+static void render_solid_color_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color, uint8_t brightness)
 {
   for (int i = 0; i < n; i++) {
-    ESP_ERROR_CHECK( led_strip_spi_set_pixel(leds, i, color) );
+    ESP_ERROR_CHECK( led_strip_spi_set_pixel_brightness(leds, i, color, brightness) );
   }
 }
 
@@ -81,39 +86,73 @@ static void render_led_pattern(led_strip_spi_t* leds, uint8_t n, uint8_t pattern
     .b = 255
   };
 
+
+  static uint8_t default_brightness = 50;
+
   switch (pattern) {
     case 1:
-      render_solid_color_pattern(leds, n, kColorRed);
+      render_solid_color_pattern(leds, n, kColorRed, default_brightness);
       break;
     case 2:
-      render_solid_color_pattern(leds, n, kColorGreen);
+      render_solid_color_pattern(leds, n, kColorGreen, default_brightness);
       break;
     case 3:
-      render_solid_color_pattern(leds, n, kColorBlue);
+      render_solid_color_pattern(leds, n, kColorBlue, default_brightness);
       break;
     case 4:
-      render_solid_color_pattern(leds, n, kColorYellow);
+      render_solid_color_pattern(leds, n, kColorYellow, default_brightness);
       break;
     case 5:
-      render_solid_color_pattern(leds, n, kColorCyan);
+      render_solid_color_pattern(leds, n, kColorCyan, default_brightness);
       break;
     case 6:
-      render_solid_color_pattern(leds, n, kColorMagenta);
+      render_solid_color_pattern(leds, n, kColorMagenta, default_brightness);
       break;
     case 7:
-      render_solid_color_pattern(leds, n, kColorRed);
+      render_solid_color_pattern(leds, n, kColorRed, default_brightness);
       break;
     default:
-      render_solid_color_pattern(leds, n, kColorGreen);
+      render_solid_color_pattern(leds, n, kColorGreen, default_brightness);
       break;
   }
 
   ESP_ERROR_CHECK( led_strip_spi_flush(leds) );
 }
 
+static void enter_deep_sleep_mode(button_handle_t mode_button)
+{
+  TaskHandle_t render_task = nullptr;
+
+  portENTER_CRITICAL(&state_lock);
+  saved_led_pattern = current_led_pattern;
+  stop_render_requested = true;
+  render_task = render_task_handle;
+  render_stop_waiter_handle = xTaskGetCurrentTaskHandle();
+  portEXIT_CRITICAL(&state_lock);
+
+  if (render_task != nullptr) {
+    // Wake render task immediately so it can process stop request and exit.
+    xTaskNotifyGive(render_task);
+
+    // Wait for render task to exit and flush all-zero frame.
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0) {
+      ESP_LOGW(TAG, "Timed out waiting for render task to stop");
+    }
+  }
+
+  // wait for user to release button
+  while (iot_button_get_key_level(mode_button) == 1) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+
+  // set interrupt to wake up on button press and go into deep sleep
+  esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(BIT(kGpioButton), ESP_GPIO_WAKEUP_GPIO_LOW);
+  esp_deep_sleep_start();
+}
+
 static void render_task(void* __unused(argp))
 {
-  uint8_t pattern = -1;
+  uint8_t pattern = 1;
 
   static spi_device_handle_t device_handler = nullptr;
 
@@ -134,14 +173,39 @@ static void render_task(void* __unused(argp))
   ESP_ERROR_CHECK( led_strip_spi_init(&led_strip) );
 
   while (true) {
+    bool should_stop = false;
+
     portENTER_CRITICAL(&state_lock);
     pattern = current_led_pattern;
+    should_stop = stop_render_requested;
     portEXIT_CRITICAL(&state_lock);
+
+    if (should_stop) {
+      break;
+    }
 
     render_led_pattern(&led_strip, kLedStripLength, pattern);
 
-    vTaskDelay(pdMS_TO_TICKS(kRenderTimerPeriodMs));
+    // Sleep until next frame, but allow immediate wake-up when stop is requested.
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kRenderTimerPeriodMs));
   }
+
+  // Ensure LEDs are physically driven to off before stopping the task.
+  render_solid_color_pattern(&led_strip, kLedStripLength, rgb_t{ .r = 0, .g = 0, .b = 0 }, 0);
+  ESP_ERROR_CHECK( led_strip_spi_flush(&led_strip) );
+
+  TaskHandle_t waiter = nullptr;
+  portENTER_CRITICAL(&state_lock);
+  waiter = render_stop_waiter_handle;
+  render_task_handle = nullptr;
+  render_stop_waiter_handle = nullptr;
+  portEXIT_CRITICAL(&state_lock);
+
+  if (waiter != nullptr) {
+    xTaskNotifyGive(waiter);
+  }
+
+  vTaskDelete(nullptr);
 }
 
 
@@ -186,11 +250,8 @@ extern "C" void app_main(void)
     },
   };
 
-  err = iot_button_register_cb(button, BUTTON_LONG_PRESS_START, &button_long_press_event_args, [](void* __unused(button), void* __unused(user_data)) {
-    ESP_LOGI(TAG, "Button long press");
-    saved_led_pattern = current_led_pattern;
-    esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(BIT(kGpioButton), ESP_GPIO_WAKEUP_GPIO_LOW);
-    esp_deep_sleep_start();
+  err = iot_button_register_cb(button, BUTTON_LONG_PRESS_START, &button_long_press_event_args, [](void* button_handle, void* __unused(user_data)) {
+    enter_deep_sleep_mode( (button_handle_t) button_handle );
   }, nullptr);
 
   if (err != ESP_OK) {
@@ -216,6 +277,7 @@ extern "C" void app_main(void)
 
   if (wakeup_causes & BIT(ESP_SLEEP_WAKEUP_GPIO)) {
     ESP_LOGI(TAG, "Woke up by EXT0 GPIO");
+    current_led_pattern = saved_led_pattern;
   }
 
   auto task_created = xTaskCreate(render_task, "render_task", kRenderTaskStackSize, NULL, 9, &render_task_handle);
