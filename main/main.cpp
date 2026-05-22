@@ -249,7 +249,7 @@ static void enter_deep_sleep_mode(button_handle_t mode_button)
   }
 
   // Hold SPI pins low through deep sleep so SK9822 LEDs don't glitch
-  const gpio_num_t spi_pins[] = { kGpioLedStripData, kGpioLedStripClock };
+  gpio_num_t const spi_pins[] = { kGpioLedStripData, kGpioLedStripClock };
   for (gpio_num_t pin : spi_pins) {
     gpio_set_direction(pin, GPIO_MODE_OUTPUT);
     gpio_set_level(pin, 0);
@@ -331,22 +331,18 @@ static void render_task(void* __unused(argp))
 
 extern "C" void app_main(void)
 {
-  esp_err_t err;
-
-  const gpio_num_t spi_pins[] = { kGpioLedStripData, kGpioLedStripClock };
   gpio_deep_sleep_hold_dis();
-  for (gpio_num_t pin : spi_pins) {
-    gpio_hold_dis(pin);
-  }
 
+  ESP_ERROR_CHECK( gpio_hold_dis(kGpioLedStripData) );
+  ESP_ERROR_CHECK( gpio_hold_dis(kGpioLedStripClock) );
   ESP_ERROR_CHECK( led_strip_spi_install() );
 
-  const button_config_t button_config = {
+  button_config_t const button_config = {
       .long_press_time = kButtonLongPressMs,
       .short_press_time = kButtonShortPressMs,
   };
 
-  const button_gpio_config_t button_gpio_config = {
+  button_gpio_config_t const button_gpio_config = {
       .gpio_num = kGpioButton,
       .active_level = 0,
       .enable_power_save = false,
@@ -355,21 +351,13 @@ extern "C" void app_main(void)
 
   button_handle_t button = nullptr;
   ESP_ERROR_CHECK( iot_button_new_gpio_device(&button_config, &button_gpio_config, &button) );
-
-  err = iot_button_register_cb(button, BUTTON_SINGLE_CLICK, nullptr, [](void* __unused(button), void* __unused(user_data)) {
-    uint8_t new_pattern = 1;
-    portENTER_CRITICAL(&state_lock);
-    current_led_pattern = (current_led_pattern % kLedModeCount) + 1;
-    new_pattern = current_led_pattern;
-    portEXIT_CRITICAL(&state_lock);
-
-    ESP_LOGI(TAG, "Button single click, current pattern: %u", new_pattern);
-  }, nullptr);
-
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to register single-click callback: %s", esp_err_to_name(err));
-    return;
-  }
+  ESP_ERROR_CHECK( iot_button_register_cb(button, BUTTON_SINGLE_CLICK, nullptr,
+    [](void* __unused(button), void* __unused(user_data))
+    {
+      portENTER_CRITICAL(&state_lock);
+      current_led_pattern = (current_led_pattern % kLedModeCount) + 1;
+      portEXIT_CRITICAL(&state_lock);
+    }, nullptr));
 
   button_event_args_t button_long_press_event_args = {
     .long_press = {
@@ -377,14 +365,12 @@ extern "C" void app_main(void)
     },
   };
 
-  err = iot_button_register_cb(button, BUTTON_LONG_PRESS_START, &button_long_press_event_args, [](void* button_handle, void* __unused(user_data)) {
-    enter_deep_sleep_mode( (button_handle_t) button_handle );
-  }, nullptr);
-
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to register long-press callback: %s", esp_err_to_name(err));
-    return;
-  }
+  ESP_ERROR_CHECK( iot_button_register_cb(button, BUTTON_LONG_PRESS_START, &button_long_press_event_args,
+    [](void* button_handle, void* __unused(user_data))
+    {
+      button_handle_t b = reinterpret_cast<button_handle_t>(button_handle);
+      enter_deep_sleep_mode(b);
+    }, nullptr));
 
   button_event_args_t button_multiple_click_event_args = {
     .multiple_clicks = {
@@ -392,22 +378,18 @@ extern "C" void app_main(void)
     },
   };
 
-  err = iot_button_register_cb(button, BUTTON_MULTIPLE_CLICK, &button_multiple_click_event_args, [](void* __unused(button), void* __unused(user_data)) {
-    ESP_LOGI(TAG, "Button multiple click");
-  }, nullptr);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to register multiple-click callback: %s", esp_err_to_name(err));
-    return;
-  }
+  ESP_ERROR_CHECK( iot_button_register_cb(button, BUTTON_MULTIPLE_CLICK, &button_multiple_click_event_args,
+    [](void* __unused(button), void* __unused(user_data))
+    {
+      ESP_LOGI(TAG, "TODO: enter setup mode");
+    }, nullptr));
 
-  auto wakeup_causes = esp_sleep_get_wakeup_causes();
-
+  auto const wakeup_causes = esp_sleep_get_wakeup_causes();
   if (wakeup_causes & BIT(ESP_SLEEP_WAKEUP_GPIO)) {
-    ESP_LOGI(TAG, "Woke up by EXT0 GPIO");
     current_led_pattern = saved_led_pattern;
   }
 
-  auto task_created = xTaskCreate(render_task, "render_task", kRenderTaskStackSize, NULL, 9, &render_task_handle);
+  auto const task_created = xTaskCreate(render_task, "render_task", kRenderTaskStackSize, NULL, 9, &render_task_handle);
   if (task_created != pdPASS) {
     ESP_LOGE(TAG, "Failed to create render task");
     return;
