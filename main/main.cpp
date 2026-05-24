@@ -50,7 +50,7 @@ static constexpr rgb_t kInstigatorColors[] = {
 
 enum class LedPattern : uint8_t
 {
-  kSolidRed = 1,
+  kSolidRed = 0,
   kChase,
   kPulse,
   kStrobe,
@@ -59,7 +59,7 @@ enum class LedPattern : uint8_t
   kLast = kRandom
 };
 
-constexpr LedPattern NextLedPattern(LedPattern pattern)
+constexpr LedPattern GetNextLedPattern(LedPattern pattern)
 {
   using LedPatternBaseType = std::underlying_type_t<LedPattern>;
 
@@ -72,7 +72,7 @@ constexpr LedPattern NextLedPattern(LedPattern pattern)
   return static_cast<LedPattern>(value);
 }
 
-static constexpr uint8_t kLedModeCount = static_cast<uint8_t>(LedPattern::kRandom);
+static constexpr uint8_t kLedModeCount = static_cast<uint8_t>(LedPattern::kLast) + 1;
 
 // globals
 static const char* TAG = "main";
@@ -111,6 +111,35 @@ struct PatternContext {
     strobe_on = false;
   }
 };
+
+struct PatternConfig {
+  rgb_t color;
+  uint8_t brightness;
+};
+
+struct PatternDefinition;
+
+using PatternRenderFn = void (*)(
+  led_strip_spi_t* leds,
+  uint8_t n,
+  PatternContext* ctx,
+  PatternDefinition const& definition,
+  PatternConfig const& config);
+
+struct PatternDefinition {
+  PatternRenderFn const render;
+  rgb_t const* const palette;
+  uint8_t const palette_size;
+  PatternConfig const default_config;
+};
+
+static PatternConfig g_pattern_configs[kLedModeCount];
+
+constexpr uint8_t PatternIndex(LedPattern pattern)
+{
+  using LedPatternBaseType = std::underlying_type_t<LedPattern>;
+  return static_cast<LedPatternBaseType>(pattern);
+}
 
 static void render_solid_color_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color, uint8_t brightness)
 {
@@ -225,31 +254,84 @@ static void render_random_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t const*
   }
 }
 
+static void render_solid_definition(led_strip_spi_t* leds, uint8_t n, PatternContext* __unused(ctx), PatternDefinition const& __unused(definition), PatternConfig const& config)
+{
+  render_solid_color_pattern(leds, n, config.color, config.brightness);
+}
+
+static void render_chase_definition(led_strip_spi_t* leds, uint8_t n, PatternContext* ctx, PatternDefinition const& __unused(definition), PatternConfig const& config)
+{
+  render_chase_pattern(leds, n, config.color, config.brightness, ctx);
+}
+
+static void render_pulse_definition(led_strip_spi_t* leds, uint8_t n, PatternContext* ctx, PatternDefinition const& __unused(definition), PatternConfig const& config)
+{
+  render_pulse_pattern(leds, n, config.color, config.brightness, ctx);
+}
+
+static void render_strobe_definition(led_strip_spi_t* leds, uint8_t n, PatternContext* ctx, PatternDefinition const& __unused(definition), PatternConfig const& config)
+{
+  render_strobe_pattern(leds, n, config.color, config.brightness, ctx);
+}
+
+static void render_twinkle_definition(led_strip_spi_t* leds, uint8_t n, PatternContext* ctx, PatternDefinition const& __unused(definition), PatternConfig const& config)
+{
+  render_twinkle_pattern(leds, n, config.color, config.brightness, ctx);
+}
+
+static void render_random_definition(led_strip_spi_t* leds, uint8_t n, PatternContext* ctx, PatternDefinition const& definition, PatternConfig const& config)
+{
+  render_random_pattern(leds, n, definition.palette, definition.palette_size, config.brightness, ctx);
+}
+
+static constexpr PatternDefinition kPatternDefinitions[] = {
+  { render_solid_definition, nullptr, 0, { kColorRed, kDefaultBrightness } },
+  { render_chase_definition, nullptr, 0, { kColorRed, kDefaultBrightness } },
+  { render_pulse_definition, nullptr, 0, { kColorRed, kDefaultBrightness } },
+  { render_strobe_definition, nullptr, 0, { kColorRed, kDefaultBrightness } },
+  { render_twinkle_definition, nullptr, 0, { kColorRed, kDefaultBrightness } },
+  {
+    render_random_definition,
+    kInstigatorColors, 2,
+    {
+      kColorRed,
+      30
+    }
+  },
+};
+
+static PatternDefinition const& GetPatternDefinition(LedPattern pattern)
+{
+  uint8_t const index = PatternIndex(pattern);
+  if (index >= kLedModeCount) {
+    return kPatternDefinitions[0];
+  }
+
+  return kPatternDefinitions[index];
+}
+
+static void InitializePatternConfigs()
+{
+  for (uint8_t index = 0; index < kLedModeCount; ++index) {
+    g_pattern_configs[index] = kPatternDefinitions[index].default_config;
+  }
+}
+
+static PatternConfig const& GetPatternConfig(LedPattern pattern)
+{
+  uint8_t const index = PatternIndex(pattern);
+  if (index >= kLedModeCount) {
+    return g_pattern_configs[0];
+  }
+
+  return g_pattern_configs[index];
+}
+
 static void render_led_pattern(led_strip_spi_t* leds, uint8_t n, LedPattern pattern, PatternContext* ctx)
 {
-  switch (pattern) {
-    case LedPattern::kSolidRed:
-      render_solid_color_pattern(leds, n, kColorRed, kDefaultBrightness);
-      break;
-    case LedPattern::kChase:
-      render_chase_pattern(leds, n, kColorRed, kDefaultBrightness, ctx);
-      break;
-    case LedPattern::kPulse:
-      render_pulse_pattern(leds, n, kColorRed, kDefaultBrightness, ctx);
-      break;
-    case LedPattern::kStrobe:
-      render_strobe_pattern(leds, n, kColorRed, kDefaultBrightness, ctx);
-      break;
-    case LedPattern::kTwinkle:
-      render_twinkle_pattern(leds, n, kColorRed, kDefaultBrightness, ctx);
-      break;
-    case LedPattern::kRandom:
-      render_random_pattern(leds, n, kInstigatorColors, 2, 30, ctx);
-      break;
-    default:
-      render_solid_color_pattern(leds, n, kColorRed, kDefaultBrightness);
-      break;
-  }
+  PatternDefinition const& definition = GetPatternDefinition(pattern);
+  PatternConfig const& config = GetPatternConfig(pattern);
+  definition.render(leds, n, ctx, definition, config);
 
   esp_err_t err = led_strip_spi_flush(leds);
   if (err != ESP_OK) {
@@ -366,6 +448,8 @@ static void render_task(void* __unused(argp))
 
 extern "C" void app_main(void)
 {
+  InitializePatternConfigs();
+
   gpio_deep_sleep_hold_dis();
 
   ESP_ERROR_CHECK( gpio_hold_dis(kGpioLedStripData) );
@@ -390,7 +474,7 @@ extern "C" void app_main(void)
     [](void* __unused(button), void* __unused(user_data))
     {
       portENTER_CRITICAL(&state_lock);
-      current_led_pattern = NextLedPattern(current_led_pattern);
+      current_led_pattern = GetNextLedPattern(current_led_pattern);
       portEXIT_CRITICAL(&state_lock);
     }, nullptr));
 
