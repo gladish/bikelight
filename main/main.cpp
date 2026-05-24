@@ -33,6 +33,20 @@ static constexpr gpio_num_t kGpioLedStripClock = GPIO_NUM_8;
 static constexpr gpio_num_t kGpioLedStripData = GPIO_NUM_10;  // mosi
 static constexpr uint32_t kButtonTaskStackSize = 3072;
 static constexpr uint32_t kRenderTaskStackSize = 3072;
+static constexpr uint32_t kStrobeOnDurationUs = 50 * 1000;
+static constexpr uint32_t kStrobeOffDurationUs = 150 * 1000;
+static constexpr uint32_t kTwinkleIntervalUs = 200 * 1000;
+static constexpr uint32_t kRandomChangeIntervalUs = 500 * 1000;
+static constexpr uint8_t kDefaultBrightness = 40;
+static constexpr rgb_t kColorRed = {
+  .r = 255,
+  .g = 0,
+  .b = 0,
+};
+static constexpr rgb_t kInstigatorColors[] = {
+  {255, 60, 150},
+  {0, 170, 220},
+};
 
 enum class LedPattern : uint8_t
 {
@@ -71,54 +85,72 @@ static bool stop_render_requested = false;
 // deep sleep saved
 RTC_DATA_ATTR LedPattern saved_led_pattern = LedPattern::kSolidRed;
 
-typedef struct
+struct AnimationClock
 {
   int64_t last_update_us;
   int64_t now_us;
-} animation_clock_t;
+};
+
+struct PatternContext {
+  AnimationClock clock;
+  int chase_index;
+  bool chase_forward;
+  bool strobe_on;
+
+  PatternContext()
+  {
+    reset();
+  }
+
+  void reset()
+  {
+    clock.last_update_us = 0;
+    clock.now_us = 0;
+    chase_index = 0;
+    chase_forward = true;
+    strobe_on = false;
+  }
+};
 
 static void render_solid_color_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color, uint8_t brightness)
 {
   ESP_ERROR_CHECK( led_strip_spi_set_pixels_brightness(leds, 0, n, color, brightness) );
 }
 
-static void render_chase_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color, uint8_t brightness, animation_clock_t* clock)
+static void render_chase_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color, uint8_t brightness, PatternContext* ctx)
 {
-  static int index = 0;
-  static bool forward = true;
-
-  if (clock->now_us - clock->last_update_us >= 100 * 1000) {
-    clock->last_update_us = clock->now_us;
+  if (ctx->clock.now_us - ctx->clock.last_update_us >= 100 * 1000) {
+    ctx->clock.last_update_us = ctx->clock.now_us;
 
     for (int i = 0; i < n; i++) {
-      if (i == index) {
+      if (i == ctx->chase_index) {
         ESP_ERROR_CHECK( led_strip_spi_set_pixel_brightness(leds, i, color, brightness) );
       } else {
         ESP_ERROR_CHECK( led_strip_spi_set_pixel_brightness(leds, i, color, 0) );
       }
     }
 
-    if (forward) {
-      index++;
-      if (index >= n) {
-        index = n - 2;
-        forward = false;
+    if (ctx->chase_forward) {
+      ctx->chase_index++;
+      if (ctx->chase_index >= n) {
+        ctx->chase_index = n - 2;
+        ctx->chase_forward = false;
       }
     } else {
-      index--;
-      if (index < 0) {
-        index = 1;
-        forward = true;
+      ctx->chase_index--;
+      if (ctx->chase_index < 0) {
+        ctx->chase_index = 1;
+        ctx->chase_forward = true;
       }
     }
   }
 }
 
-static void render_pulse_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color, uint8_t max_brightness, animation_clock_t* clock)
+static void render_pulse_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color, uint8_t max_brightness, PatternContext* ctx)
 {
   constexpr int64_t kPulsePeriodUs = 2'000'000;
 
-  int64_t cycle_us = clock->now_us % kPulsePeriodUs;
+  int64_t cycle_us = ctx->clock.now_us % kPulsePeriodUs;
 
   float phase = (float)cycle_us / (float)kPulsePeriodUs;
 
@@ -136,37 +168,31 @@ static void render_pulse_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color, 
   }
 }
 
-static void render_strobe_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color, uint8_t brightness, animation_clock_t* clock)
+static void render_strobe_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color, uint8_t brightness, PatternContext* ctx)
 {
-  static bool on = false;
-  static uint32_t on_duration_us = 50 * 1000;
-  static uint32_t off_duration_us = 150 * 1000;
-
-  if (on && (clock->now_us - clock->last_update_us >= on_duration_us)) {
+  if (ctx->strobe_on && (ctx->clock.now_us - ctx->clock.last_update_us >= kStrobeOnDurationUs)) {
     // turn off
     esp_err_t err = led_strip_spi_set_pixels_brightness(leds, 0, n, color, 0);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed to set pixel color: %s", esp_err_to_name(err));
     }
-    on = false;
-    clock->last_update_us = clock->now_us;
-  } else if (!on && (clock->now_us - clock->last_update_us >= off_duration_us)) {
+    ctx->strobe_on = false;
+    ctx->clock.last_update_us = ctx->clock.now_us;
+  } else if (!ctx->strobe_on && (ctx->clock.now_us - ctx->clock.last_update_us >= kStrobeOffDurationUs)) {
     // turn on
     esp_err_t err = led_strip_spi_set_pixels_brightness(leds, 0, n, color, brightness);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed to set pixel color: %s", esp_err_to_name(err));
     }
-    on = true;
-    clock->last_update_us = clock->now_us;
+    ctx->strobe_on = true;
+    ctx->clock.last_update_us = ctx->clock.now_us;
   }
 }
 
-static void render_twinkle_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color, uint8_t brightness, animation_clock_t* clock)
+static void render_twinkle_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color, uint8_t brightness, PatternContext* ctx)
 {
-  static uint32_t twinkle_interval_us = 200 * 1000;
-
-  if (clock->now_us - clock->last_update_us >= twinkle_interval_us) {
-    clock->last_update_us = clock->now_us;
+  if (ctx->clock.now_us - ctx->clock.last_update_us >= kTwinkleIntervalUs) {
+    ctx->clock.last_update_us = ctx->clock.now_us;
 
     for (int i = 0; i < n; i++) {
       if (esp_random() % 2 == 0) {
@@ -184,12 +210,10 @@ static void render_twinkle_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t color
   }
 }
 
-static void render_random_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t const* colors, uint8_t color_count, uint8_t brightness, animation_clock_t* clock)
+static void render_random_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t const* colors, uint8_t color_count, uint8_t brightness, PatternContext* ctx)
 {
-  static uint32_t change_interval_us = 500 * 1000;
-
-  if (clock->now_us - clock->last_update_us >= change_interval_us) {
-    clock->last_update_us = clock->now_us;
+  if (ctx->clock.now_us - ctx->clock.last_update_us >= kRandomChangeIntervalUs) {
+    ctx->clock.last_update_us = ctx->clock.now_us;
 
     for (int i = 0; i < n; i++) {
       rgb_t color = colors[esp_random() % color_count];
@@ -201,42 +225,29 @@ static void render_random_pattern(led_strip_spi_t* leds, uint8_t n, rgb_t const*
   }
 }
 
-static void render_led_pattern(led_strip_spi_t* leds, uint8_t n, LedPattern pattern, animation_clock_t* clock)
+static void render_led_pattern(led_strip_spi_t* leds, uint8_t n, LedPattern pattern, PatternContext* ctx)
 {
-  static rgb_t const kColorRed = rgb_t{
-    .r = 255,
-    .g = 0,
-    .b = 0
-  };
-
-  static rgb_t const kInstigatorColors[] = {
-    {255, 60, 150},
-    {0, 170, 220}
-  };
-
-  static uint8_t default_brightness = 40;
-
   switch (pattern) {
     case LedPattern::kSolidRed:
-      render_solid_color_pattern(leds, n, kColorRed, default_brightness);
+      render_solid_color_pattern(leds, n, kColorRed, kDefaultBrightness);
       break;
     case LedPattern::kChase:
-      render_chase_pattern(leds, n, kColorRed, default_brightness, clock);
+      render_chase_pattern(leds, n, kColorRed, kDefaultBrightness, ctx);
       break;
     case LedPattern::kPulse:
-      render_pulse_pattern(leds, n, kColorRed, default_brightness, clock);
+      render_pulse_pattern(leds, n, kColorRed, kDefaultBrightness, ctx);
       break;
     case LedPattern::kStrobe:
-      render_strobe_pattern(leds, n, kColorRed, default_brightness, clock);
+      render_strobe_pattern(leds, n, kColorRed, kDefaultBrightness, ctx);
       break;
     case LedPattern::kTwinkle:
-      render_twinkle_pattern(leds, n, kColorRed, default_brightness, clock);
+      render_twinkle_pattern(leds, n, kColorRed, kDefaultBrightness, ctx);
       break;
     case LedPattern::kRandom:
-      render_random_pattern(leds, n, kInstigatorColors, 2, 30, clock);
+      render_random_pattern(leds, n, kInstigatorColors, 2, 30, ctx);
       break;
     default:
-      render_solid_color_pattern(leds, n, kColorRed, default_brightness);
+      render_solid_color_pattern(leds, n, kColorRed, kDefaultBrightness);
       break;
   }
 
@@ -289,6 +300,7 @@ static void enter_deep_sleep_mode(button_handle_t mode_button)
 static void render_task(void* __unused(argp))
 {
   LedPattern pattern = LedPattern::kSolidRed;
+  PatternContext pattern_context;
 
   static spi_device_handle_t device_handler = nullptr;
 
@@ -308,27 +320,26 @@ static void render_task(void* __unused(argp))
 
   ESP_ERROR_CHECK( led_strip_spi_init(&led_strip) );
 
-  animation_clock_t clock = {
-    .last_update_us = 0,
-    .now_us = 0,
-  };
-
   while (true) {
     bool should_stop = false;
+    LedPattern next_pattern = pattern;
 
     portENTER_CRITICAL(&state_lock);
-    if (current_led_pattern != pattern)
-      clock.last_update_us = 0;
-    pattern = current_led_pattern;
+    next_pattern = current_led_pattern;
     should_stop = stop_render_requested;
     portEXIT_CRITICAL(&state_lock);
+
+    if (next_pattern != pattern) {
+      pattern = next_pattern;
+      pattern_context.reset();
+    }
 
     if (should_stop) {
       break;
     }
 
-    clock.now_us = esp_timer_get_time();
-    render_led_pattern(&led_strip, kLedStripLength, pattern, &clock);
+    pattern_context.clock.now_us = esp_timer_get_time();
+    render_led_pattern(&led_strip, kLedStripLength, pattern, &pattern_context);
 
     // Sleep until next frame, but allow immediate wake-up when stop is requested.
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kRenderTimerPeriodMs));
