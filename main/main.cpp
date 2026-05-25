@@ -9,6 +9,11 @@
 #include <esp_random.h>
 #include <esp_sleep.h>
 #include <esp_timer.h>
+#include <nvs_flash.h>
+
+#include <esp_bt.h>
+#include <esp_bt_main.h>
+#include <esp_gatts_api.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -41,9 +46,31 @@ static TaskHandle_t render_stop_waiter_handle;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static LedPattern current_led_pattern = LedPattern::kSolidRed;
 static bool stop_render_requested = false;
+static bool in_setup_mode = false;
 
 // deep sleep saved
 RTC_DATA_ATTR LedPattern saved_led_pattern = LedPattern::kSolidRed;
+
+static void InitializeBluetooth()
+{
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK( nvs_flash_erase() );
+    err = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK( err );
+
+  // ESP32-C3 supports BLE only, so release classic BT memory.
+  ESP_ERROR_CHECK( esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT) );
+
+  esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK( esp_bt_controller_init(&bt_cfg) );
+  ESP_ERROR_CHECK( esp_bt_controller_enable(ESP_BT_MODE_BLE) );
+  ESP_ERROR_CHECK( esp_bluedroid_init() );
+  ESP_ERROR_CHECK( esp_bluedroid_enable() );
+
+  ESP_LOGI(TAG, "Bluetooth BLE stack initialized");
+}
 
 
 static void enter_deep_sleep_mode(button_handle_t mode_button)
@@ -109,13 +136,16 @@ static void render_task(void* __unused(argp))
 
   ESP_ERROR_CHECK( led_strip_spi_init(&led_strip) );
 
+  bool should_stop = false;
+  bool setup_mode = false;
+
   while (true) {
-    bool should_stop = false;
     LedPattern next_pattern = pattern;
 
     portENTER_CRITICAL(&state_lock);
     next_pattern = current_led_pattern;
     should_stop = stop_render_requested;
+    setup_mode = in_setup_mode;
     portEXIT_CRITICAL(&state_lock);
 
     if (next_pattern != pattern) {
@@ -128,7 +158,22 @@ static void render_task(void* __unused(argp))
     }
 
     pattern_context.clock.now_us = esp_timer_get_time();
-    RenderLedPattern(&led_strip, kLedStripLength, pattern, &pattern_context);
+
+    if (!setup_mode) {
+      RenderLedPattern(&led_strip, kLedStripLength, pattern, &pattern_context);
+    }
+    else {
+      static bool stated = false;
+      if (!stated) {
+        ESP_LOGI(TAG, "In setup mode, showing solid blue pattern");
+        stated = true;
+      }
+      // In setup mode, just show a blue light to indicate bluetooth mode.
+      ESP_ERROR_CHECK( RenderSolidColor(&led_strip,
+        kLedStripLength, rgb_t{ .r = 0, .g = 0, .b = 255 }, 20)
+      );
+      ESP_ERROR_CHECK( led_strip_spi_flush(&led_strip) );
+    }
 
     // Sleep until next frame, but allow immediate wake-up when stop is requested.
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kRenderTimerPeriodMs));
@@ -181,7 +226,9 @@ extern "C" void app_main(void)
     [](void* __unused(button), void* __unused(user_data))
     {
       portENTER_CRITICAL(&state_lock);
-      current_led_pattern = GetNextLedPattern(current_led_pattern);
+      if (!in_setup_mode) {
+        current_led_pattern = GetNextLedPattern(current_led_pattern);
+      }
       portEXIT_CRITICAL(&state_lock);
     }, nullptr));
 
@@ -207,7 +254,16 @@ extern "C" void app_main(void)
   ESP_ERROR_CHECK( iot_button_register_cb(button, BUTTON_MULTIPLE_CLICK, &button_multiple_click_event_args,
     [](void* __unused(button), void* __unused(user_data))
     {
-      ESP_LOGI(TAG, "TODO: enter setup mode");
+      bool setup_mode = false;
+
+      portENTER_CRITICAL(&state_lock);
+      setup_mode = in_setup_mode;
+      if (!setup_mode) in_setup_mode = true;
+      portEXIT_CRITICAL(&state_lock);
+
+      if (!setup_mode) {
+        InitializeBluetooth();
+      }
     }, nullptr));
 
   auto const wakeup_causes = esp_sleep_get_wakeup_causes();
